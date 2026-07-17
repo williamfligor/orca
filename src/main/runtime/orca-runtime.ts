@@ -5278,6 +5278,7 @@ export class OrcaRuntimeService {
         // Why: whole-tab close is a lifecycle transaction. The renderer reply
         // arrives only after canonical retirement and a forced session flush.
         await this.notifier.closeTerminalTab(tab.parentTabId)
+        this.emitCloseUpdatedSnapshot(worktreeId, snapshot!, tab)
         return { closed: true }
       }
       // Why: notifier implementations without the acknowledged relay may expose
@@ -5314,7 +5315,60 @@ export class OrcaRuntimeService {
     } else {
       this.notifier?.closeSessionTab?.(tab.id, worktreeId)
     }
+    // Why: emit the updated snapshot so paired mobile clients see the tab drop
+    // immediately instead of waiting on renderer re-publication. The 10-second
+    // mobile tombstone expires, and if the host snapshot hasn't caught up, the
+    // just-closed tab flashes back. Only skip when the headless close already
+    // emitted (those paths return early above).
+    this.emitCloseUpdatedSnapshot(worktreeId, snapshot!, tab)
     return { closed: true }
+  }
+
+  /** Remove the closed tab(s) from the mobile snapshot and publish it. */
+  private emitCloseUpdatedSnapshot(
+    worktreeId: string,
+    snapshot: RuntimeMobileSessionTabsSnapshot,
+    tab:
+      | RuntimeMobileSessionTerminalTab
+      | RuntimeMobileSessionBrowserTab
+      | RuntimeMobileSessionSnapshotTab
+  ): void {
+    const tabIdsToRemove = new Set<string>()
+    if (tab.type === 'terminal') {
+      const closingWholeParent =
+        snapshot.tabs.filter(
+          (candidate) => candidate.type === 'terminal' && candidate.parentTabId === tab.parentTabId
+        ).length <= 1
+      if (closingWholeParent) {
+        for (const candidate of snapshot.tabs) {
+          if (candidate.type === 'terminal' && candidate.parentTabId === tab.parentTabId) {
+            tabIdsToRemove.add(candidate.id)
+          }
+        }
+      } else {
+        tabIdsToRemove.add(tab.id)
+      }
+    } else {
+      tabIdsToRemove.add(tab.id)
+    }
+    const nextTabs = snapshot.tabs.filter((candidate) => !tabIdsToRemove.has(candidate.id))
+    const active = nextTabs.find((candidate) => candidate.isActive) ?? nextTabs[0] ?? null
+    const nextSnapshot: RuntimeMobileSessionTabsSnapshot = {
+      ...snapshot,
+      publicationEpoch: `close:${Date.now().toString(36)}`,
+      snapshotVersion: snapshot.snapshotVersion + 1,
+      activeTabId: active?.id ?? null,
+      activeTabType: active?.type ?? null,
+      tabGroups: (snapshot.tabGroups ?? []).map((group) => ({
+        ...group,
+        tabOrder: group.tabOrder.filter((id) => !tabIdsToRemove.has(id)),
+        activeTabId:
+          group.activeTabId && tabIdsToRemove.has(group.activeTabId) ? null : group.activeTabId
+      })),
+      tabs: nextTabs
+    }
+    this.mobileSessionTabsByWorktree.set(worktreeId, nextSnapshot)
+    this.emitMobileSessionTabsSnapshot(nextSnapshot)
   }
 
   private notifyRendererOfHeadlessTerminalClose(parentTabId: string): void {
@@ -12894,6 +12948,8 @@ export class OrcaRuntimeService {
     )
     const missingRuntimeWorktreeIds = new Set<string>()
     const countedPtyIds = new Set<string>()
+    const liveAgentPaneKeys = new Set<string>()
+    const liveAgentPtyIds = new Set<string>()
     for (const leaf of this.leaves.values()) {
       const summary = this.getSummaryForRuntimeWorktreeId(
         summaries,
@@ -12904,8 +12960,10 @@ export class OrcaRuntimeService {
       if (!summary) {
         continue
       }
+      liveAgentPaneKeys.add(this.makeRuntimePaneKey(leaf))
       if (leaf.ptyId) {
         countedPtyIds.add(leaf.ptyId)
+        liveAgentPtyIds.add(leaf.ptyId)
       }
       if (leaf.ptyId && leaf.connected) {
         summary.hasHostSidebarActivity = true
@@ -12939,6 +12997,10 @@ export class OrcaRuntimeService {
       if (!summary) {
         continue
       }
+      if (pty.paneKey) {
+        liveAgentPaneKeys.add(pty.paneKey)
+      }
+      liveAgentPtyIds.add(pty.ptyId)
       const previousLastOutputAt = summary.lastOutputAt
       summary.liveTerminalCount += 1
       summary.hasAttachedPty = true
@@ -12967,35 +13029,6 @@ export class OrcaRuntimeService {
         summary.hasHostSidebarActivity = true
       }
     }
-    for (const [worktreeId, tabs] of Object.entries(session?.tabsByWorktree ?? {})) {
-      if (tabs.length === 0) {
-        continue
-      }
-      const summary = this.getSummaryForRuntimeWorktreeId(
-        summaries,
-        runtimeWorktreeSummaryPathIndex,
-        missingRuntimeWorktreeIds,
-        worktreeId
-      )
-      if (!summary) {
-        continue
-      }
-      // Why: desktop can show terminal tabs that are not mounted as renderer
-      // leaves and are not currently visible in the PTY provider list. Mobile
-      // still needs those worktrees to show as terminal-bearing entries.
-      summary.liveTerminalCount = Math.max(summary.liveTerminalCount, tabs.length)
-      summary.hasAttachedPty = summary.hasAttachedPty || tabs.some((tab) => tab.ptyId !== null)
-      if (tabs.some((tab) => tab.ptyId !== null && this.ptysById.get(tab.ptyId)?.connected)) {
-        summary.hasHostSidebarActivity = true
-      }
-      for (const tab of tabs) {
-        summary.status = mergeWorktreeStatus(
-          summary.status,
-          getSavedTabWorktreeStatus(tab.title, tab.ptyId !== null)
-        )
-      }
-    }
-
     for (const [worktreeId, tabs] of Object.entries(session?.browserTabsByWorktree ?? {})) {
       if (tabs.length === 0) {
         continue
@@ -13046,7 +13079,8 @@ export class OrcaRuntimeService {
       summaries,
       runtimeWorktreeSummaryPathIndex,
       missingRuntimeWorktreeIds,
-      mirroredWorktreeIdByTabId
+      mirroredWorktreeIdByTabId,
+      { livePaneKeys: liveAgentPaneKeys, livePtyIds: liveAgentPtyIds }
     )
 
     const sorted = [...summaries.values()].sort(compareWorktreePs)
@@ -13065,7 +13099,8 @@ export class OrcaRuntimeService {
     summaries: Map<string, RuntimeWorktreePsSummary>,
     runtimeWorktreeSummaryPathIndex: RuntimeWorktreeSummaryPathIndex,
     missingRuntimeWorktreeIds: Set<string>,
-    mirroredWorktreeIdByTabId: ReadonlyMap<string, string>
+    mirroredWorktreeIdByTabId: ReadonlyMap<string, string>,
+    liveEvidence: { livePaneKeys: ReadonlySet<string>; livePtyIds: ReadonlySet<string> }
   ): void {
     // Why: most agents report via hooks (agent-hooks/server), not OSC, so the
     // hook snapshot is the primary source — same one the desktop sidebar reads.
@@ -13074,6 +13109,7 @@ export class OrcaRuntimeService {
       string,
       {
         paneKey: string
+        ptyId?: string
         tabId?: string
         worktreeId?: string
         state: ParsedAgentStatusPayload['state']
@@ -13091,6 +13127,7 @@ export class OrcaRuntimeService {
       const { payload } = snapshot
       rowSources.set(snapshot.paneKey, {
         paneKey: snapshot.paneKey,
+        ptyId: snapshot.ptyId,
         tabId: snapshot.tabId,
         worktreeId: snapshot.worktreeId,
         state: payload.state,
@@ -13139,6 +13176,15 @@ export class OrcaRuntimeService {
       const worktreeId =
         (tabId ? mirroredWorktreeIdByTabId.get(tabId) : undefined) ?? src.worktreeId
       if (!worktreeId) {
+        continue
+      }
+      // Why: only attach rows whose pane matches a currently live leaf or
+      // connected PTY. Cached hook rows for long-gone terminals must not
+      // make a worktree look active in mobile.
+      if (
+        !liveEvidence.livePaneKeys.has(src.paneKey) &&
+        (!src.ptyId || !liveEvidence.livePtyIds.has(src.ptyId))
+      ) {
         continue
       }
       const summary = this.getSummaryForRuntimeWorktreeId(
@@ -29502,10 +29548,6 @@ function getLatestAgentCandidateTitleInfo(
     }
   }
   return latest
-}
-
-function getSavedTabWorktreeStatus(title: string, hasPty: boolean): RuntimeWorktreeStatus {
-  return getDetectedWorktreeStatus(detectAgentStatusFromTitle(title), hasPty)
 }
 
 function getDetectedWorktreeStatus(
