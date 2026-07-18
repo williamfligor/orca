@@ -4465,31 +4465,57 @@ export class OrcaRuntimeService {
         if (leafIds.length === 0) {
           leafIds.push(this.deriveHeadlessLegacyTerminalLeafId(tab.id))
         }
-        return leafIds.map((leafId) => {
-          const ptyId =
-            layout?.ptyIdsByLeafId?.[leafId] ?? (leafIds.length === 1 ? tab.ptyId : null)
-          const title =
-            tab.customTitle?.trim() ||
-            tab.generatedTitle?.trim() ||
-            tab.title?.trim() ||
-            tab.defaultTitle?.trim() ||
-            `Terminal ${index + 1}`
-          return {
-            type: 'terminal' as const,
-            id: `${tab.id}::${leafId}`,
-            parentTabId: tab.id,
-            leafId,
-            title,
-            ...(ptyId ? { ptyId } : {}),
-            ...(tab.startupCwd ? { startupCwd: tab.startupCwd } : {}),
-            ...(tab.launchAgent ? { launchAgent: tab.launchAgent } : {}),
-            ...(layout ? { parentLayout: this.cloneTerminalLayoutSnapshot(layout) } : {}),
-            ...(tab.color != null ? { color: tab.color } : {}),
-            ...(tab.isPinned ? { isPinned: true } : {}),
-            ...(tab.viewMode ? { viewMode: tab.viewMode } : {}),
-            isActive: this.isPersistedTerminalLeafActive(worktreeId, tab.id, leafId, layout)
-          }
-        })
+        return leafIds
+          .filter((leafId) => {
+            // Why: only include leaves whose PTY is still live. Persisted
+            // session tabs with dead PTYs are stale artifacts that render as
+            // unresponsive spinners on mobile (no terminal handle). Check
+            // both the exact persisted PTY id and any live PTY bound to
+            // this tab+leaf (the PTY may have been reassigned).
+            if (this.ptysById.size === 0) {
+              return true // no liveness data yet — show all
+            }
+            const ptyId =
+              layout?.ptyIdsByLeafId?.[leafId] ?? (leafIds.length === 1 ? tab.ptyId : null)
+            if (!ptyId) {
+              return true // pending tab, no PTY assigned yet
+            }
+            if (this.ptysById.has(ptyId)) {
+              return true // exact PTY match
+            }
+            // Check if any live PTY is bound to this tab+leaf (reassigned)
+            for (const pty of this.ptysById.values()) {
+              if (pty.tabId === tab.id && pty.paneKey === `${tab.id}:${leafId}`) {
+                return true
+              }
+            }
+            return false
+          })
+          .map((leafId) => {
+            const ptyId =
+              layout?.ptyIdsByLeafId?.[leafId] ?? (leafIds.length === 1 ? tab.ptyId : null)
+            const title =
+              tab.customTitle?.trim() ||
+              tab.generatedTitle?.trim() ||
+              tab.title?.trim() ||
+              tab.defaultTitle?.trim() ||
+              `Terminal ${index + 1}`
+            return {
+              type: 'terminal' as const,
+              id: `${tab.id}::${leafId}`,
+              parentTabId: tab.id,
+              leafId,
+              title,
+              ...(ptyId ? { ptyId } : {}),
+              ...(tab.startupCwd ? { startupCwd: tab.startupCwd } : {}),
+              ...(tab.launchAgent ? { launchAgent: tab.launchAgent } : {}),
+              ...(layout ? { parentLayout: this.cloneTerminalLayoutSnapshot(layout) } : {}),
+              ...(tab.color != null ? { color: tab.color } : {}),
+              ...(tab.isPinned ? { isPinned: true } : {}),
+              ...(tab.viewMode ? { viewMode: tab.viewMode } : {}),
+              isActive: this.isPersistedTerminalLeafActive(worktreeId, tab.id, leafId, layout)
+            }
+          })
       })
   }
 
@@ -23573,22 +23599,24 @@ export class OrcaRuntimeService {
     const paneKey = this.getMobileTerminalPaneKey(tab)
     if (snapshotPtyId) {
       const pty = this.ptysById.get(snapshotPtyId)
-      if (!pty) {
-        return null
+      if (pty) {
+        // Why: persisted PTY ids can collide with unrelated provider ids after a
+        // restart. Only a matching spawn-time pane identity is safe to expose.
+        if (this.mobileTerminalTabMatchesPty(worktreeId, tab, pty, paneKey)) {
+          return pty
+        }
+        if (
+          options.allowWorktreeOnlyMatch === true &&
+          pty.worktreeId === worktreeId &&
+          pty.tabId === null &&
+          pty.paneKey === null
+        ) {
+          return pty
+        }
       }
-      // Why: persisted PTY ids can collide with unrelated provider ids after restart; only a matching spawn-time pane identity is safe to expose.
-      if (this.mobileTerminalTabMatchesPty(worktreeId, tab, pty, paneKey)) {
-        return pty
-      }
-      if (
-        options.allowWorktreeOnlyMatch === true &&
-        pty.worktreeId === worktreeId &&
-        pty.tabId === null &&
-        pty.paneKey === null
-      ) {
-        return pty
-      }
-      return null
+      // Why: the snapshot's PTY id is stale (the PTY was replaced or the tab
+      // was reassigned to a new daemon session). Fall through to the pane-key
+      // iteration loop so a live PTY bound to the same tab+leaf is found.
     }
     const paneKeys = new Set([`${tab.parentTabId}:${tab.leafId}`])
     if (tab.leafId === `pane:${FIRST_PANE_ID}`) {
