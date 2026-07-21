@@ -145,6 +145,13 @@ function collectPackagedRuntimePackages(electronPlatformName = process.platform)
       if (isKnownOmittedServeSimDependency(packageName, fromDir)) {
         return
       }
+      // Why: windows-native-registry is never installed on Linux build hosts
+      // and is harmless to omit (it only provides Windows-specific APIs); the
+      // config module evaluates all platform sections at load time, so the
+      // 'win32' packaging path runs even on a Linux build machine.
+      if (packageName === 'windows-native-registry') {
+        return
+      }
       throw error
     }
     if (packages.has(packageInfo.name)) {
