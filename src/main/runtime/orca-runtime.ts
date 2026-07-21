@@ -20759,6 +20759,10 @@ export class OrcaRuntimeService {
     this.claudeAgentTeams.removeTeamForLeaderHandle(handle)
     if (pty) {
       const ptyKilled = this.ptyController?.kill(pty.pty.ptyId) ?? false
+      // Why: mobile clients call terminal.close but expect the session tab to
+      // go away too. Remove the mobile session tab if one exists for this PTY
+      // (no-op when the terminal is owned by a desktop renderer instead).
+      await this.tryCloseMobileSessionTabForPty(pty.pty.worktreeId, pty.pty.tabId)
       return { handle, tabId: pty.pty.tabId ?? pty.record.tabId, ptyKilled }
     }
     this.assertGraphReady()
@@ -20772,7 +20776,27 @@ export class OrcaRuntimeService {
     if (!ptyKilled || siblingCount <= 1) {
       this.notifier?.closeTerminal(leaf.tabId, leaf.paneRuntimeId)
     }
+    // Why: same mobile session tab cleanup for the graph-backed path.
+    await this.tryCloseMobileSessionTabForPty(leaf.worktreeId, leaf.tabId)
     return { handle, tabId: leaf.tabId, ptyKilled }
+  }
+
+  /** Best-effort removal of a mobile session tab when terminal.close is called
+   *  from a mobile client. No-op when the terminal is owned by a desktop renderer
+   *  or the tab was already removed — prevents mobile's handle-only close from
+   *  leaving an orphaned pending tab that auto-resurrects (#7345). */
+  private async tryCloseMobileSessionTabForPty(
+    worktreeId: string | null | undefined,
+    tabId: string | null | undefined
+  ): Promise<void> {
+    if (!worktreeId || !tabId) {
+      return
+    }
+    try {
+      await this.closeMobileSessionTab(`id:${worktreeId}`, tabId)
+    } catch {
+      // Not a mobile session tab, or already closed — nothing to do.
+    }
   }
 
   async closeTerminalTab(handle: string): Promise<RuntimeTerminalClose> {
