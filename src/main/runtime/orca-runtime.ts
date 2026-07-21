@@ -2406,6 +2406,10 @@ export class OrcaRuntimeService {
   // iterates them all. Listeners are cleaned up via subscriptionCleanups.
   private notificationListeners = new Set<(event: MobileNotificationEvent) => void>()
   private ptysById = new Map<string, RuntimePtyWorktreeRecord>()
+  /** True after the first refreshMobileSessionPtyRecords completes so
+   *  buildHeadlessMobileSessionTerminalTabs can distinguish "startup, no
+   *  liveness data yet" from "all PTYs are dead after restart." */
+  private ptysByIdPopulated = false
   private wslDistroByPtyId = new Map<string, string>()
   private titleObservationSequence = 0
   private headlessTerminals = new Map<string, RuntimeHeadlessTerminal>()
@@ -4472,7 +4476,7 @@ export class OrcaRuntimeService {
             // unresponsive spinners on mobile (no terminal handle). Check
             // both the exact persisted PTY id and any live PTY bound to
             // this tab+leaf (the PTY may have been reassigned).
-            if (this.ptysById.size === 0) {
+            if (!this.ptysByIdPopulated) {
               return true // no liveness data yet — show all
             }
             const ptyId =
@@ -4952,6 +4956,11 @@ export class OrcaRuntimeService {
       resolvedWorktrees,
       isFloatingWorkspace ? targetWorktreeId : null
     )
+    // Why: regardless of how many live PTYs were found (possibly zero after
+    // restart), liveness data has been gathered. Subsequent
+    // buildHeadlessMobileSessionTerminalTabs calls can now reliably exclude
+    // stale persisted tabs whose PTY did not survive.
+    this.ptysByIdPopulated = true
   }
 
   async activateMobileSessionTab(
